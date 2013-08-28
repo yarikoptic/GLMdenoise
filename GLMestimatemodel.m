@@ -1,6 +1,6 @@
-function results = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,resampling,opt,mode)
+function [results,cache] = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,resampling,opt,cache,mode)
 
-% function results = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,resampling,opt)
+% function [results,cache] = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,resampling,opt,cache)
 %
 % <design> is the experimental design.  There are three possible cases:
 %   1. A where A is a matrix with dimensions time x conditions.
@@ -49,6 +49,7 @@ function results = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,res
 %  -1 means perform leave-one-run-out cross-validation (in this case, there
 %     must be at least two runs)
 % <opt> (optional) is a struct with the following fields:
+%   <chunknum> (optional)##############
 %   <extraregressors> (optional) is time x regressors or a cell vector
 %     of elements that are each time x regressors.  The dimensions of 
 %     <extraregressors> should mirror that of <design> (i.e. same number of 
@@ -61,7 +62,8 @@ function results = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,res
 %     are used to capture low-frequency noise fluctuations in each run.
 %     Can be a vector with length equal to the number of runs (this
 %     allows you to specify different degrees for different runs).  
-%     Default: 2.
+%     Default is to use round(L/2) for each run where L is the 
+%     duration in minutes of a given run.
 %   <seed> (optional) is the random number seed to use (this affects
 %     the selection of bootstrap samples). Default: sum(100*clock).
 %   <bootgroups> (optional) is a vector of positive integers indicating
@@ -87,6 +89,9 @@ function results = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,res
 %     absolute value of 'meanvol' and multiplying by 100.  (The absolute 
 %     value prevents negative values in 'meanvol' from flipping the sign.)
 %     Default: 1.
+%   <hrfthresh> (optional) is ###.  -Inf means to ignore default: 50.
+%   <suppressoutput> (optional) is . default: 0.
+% <cache> (optional) is ####
 %
 % Based on the experimental design (<design>, <stimdur>, <tr>) and the model 
 % specification (<hrfmodel>, <hrfknobs>), fit a GLM model to the data (<data>) 
@@ -182,7 +187,7 @@ function results = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,res
 % - In some cases, the fitted global HRF may diverge wildly from the initial 
 % seed.  This may indicate extremely low SNR and/or a problem with the coding
 % of the experimental design and/or a poor initial seed for the HRF.  If the
-% R^2 between the initial seed and the fitted global HRF is less than 50%,
+% R^2 between the initial seed and the fitted global HRF is less than opt.hrfthresh,
 % we issue a warning and simply use the initial seed as the HRF (instead of
 % relying on the fitted global HRF).  These cases should be inspected and
 % troubleshooted on a case-by-case basis.  (In GLMdenoisedata.m, a figure
@@ -198,6 +203,7 @@ function results = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,res
 % execution halts.
 %
 % History:
+% - 2013/05/21: reduce memory usage and increase code efficiency; add opt.chunknum. be careful!
 % - 2013/05/12: allow <design> to specify onset times
 % - 2013/05/12: update to indicate fractional values in design matrix are allowed.
 % - 2013/05/12 - regressors that are all zero now receive a 0 weight (instead of crashing)
@@ -220,6 +226,8 @@ function results = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,res
 % Internal input:
 % <mode> (optional) is
 %   1 means that only the 'R2' output is desired (to save computation time)
+%   2 means that hrfmodel is 'optimize', resampling is 0, and we only care
+%     about the hrf and hrffitvoxels outputs (to save time and memory)
 %   Default: 0.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% DEAL WITH INPUTS, ETC.
@@ -234,6 +242,9 @@ if ~exist('hrfknobs','var') || isempty(hrfknobs)
 end
 if ~exist('opt','var') || isempty(opt)
   opt = struct();
+end
+if ~exist('cache','var') || isempty(cache)
+  cache = [];
 end
 if ~exist('mode','var') || isempty(mode)
   mode = 0;
@@ -271,13 +282,20 @@ else
   dimtime = 2;
   xyzsize = size(data{1},1);
 end
+numvoxels = prod(xyzsize);
 
 % deal with defaults
+if ~isfield(opt,'chunknum') || isempty(opt.chunknum)
+  opt.chunknum = [];
+end
 if ~isfield(opt,'extraregressors') || isempty(opt.extraregressors)
   opt.extraregressors = cell(1,numruns);
 end
 if ~isfield(opt,'maxpolydeg') || isempty(opt.maxpolydeg)
-  opt.maxpolydeg = 2;
+  opt.maxpolydeg = zeros(1,numruns);
+  for p=1:numruns
+    opt.maxpolydeg(p) = round(((size(data{p},dimtime)*tr)/60)/2);
+  end
 end
 if ~isfield(opt,'seed') || isempty(opt.seed)
   opt.seed = sum(100*clock);
@@ -293,6 +311,12 @@ if ~isfield(opt,'hrffitmask') || isempty(opt.hrffitmask)
 end
 if ~isfield(opt,'wantpercentbold') || isempty(opt.wantpercentbold)
   opt.wantpercentbold = 1;
+end
+if ~isfield(opt,'hrfthresh') || isempty(opt.hrfthresh)
+  opt.hrfthresh = 50;
+end
+if ~isfield(opt,'suppressoutput') || isempty(opt.suppressoutput)
+  opt.suppressoutput = 0;
 end
 if isequal(hrfmodel,'assume') || isequal(hrfmodel,'optimize')
   hrfknobs = normalizemax(hrfknobs);
@@ -334,7 +358,7 @@ end
 % project out nuisance components from the data.
 % after this step, data will have polynomials removed,
 % and data2 will have both polynomials and extra regressors removed.
-data2 = {};  % NOTE: data and data2 are big --- be careful of memory usage.
+data2 = {};  % NOTE: data and data2 are big --- be careful of MEMORY usage.
 for p=1:numruns
   data{p} = squish(data{p},dimdata)';
   data2{p} = combinedmatrix{p}*data{p};
@@ -342,191 +366,330 @@ for p=1:numruns
 end
 % note that data and data2 are now in flattened format (time x voxels)!!
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% FIT MODELS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% PROCESS INDIVIDUAL CHUNKS TO SAVE MEMORY
 
-switch resamplecase
+% in the optimize case, all data needs to be processed at once (in fitmodel_helper).
+% memory is handled well in fitmodel_helper since it respects opt.chunknum in the optimize case.
+% however, memory is not handled well in the other portions of the for-loop below.
+% this should be FIXED, but it is quite hard.
+if isequal(hrfmodel,'optimize') || isempty(opt.chunknum)
+  dochunk = 0;
+  chunks = [1];  % dummy to get the for-loop going
+  dataname = 'data';
+  data2name = 'data2';
+else
+  dochunk = 1;
+  chunks = chunking(1:numvoxels,opt.chunknum);
+  dataname = 'datachunk';
+  data2name = 'data2chunk';
+end
 
-case 'full'
+% initialize
+results = struct();
 
-  % this is the full-fit case
-  
-  % fit the model to the entire dataset.  we obtain just one analysis result.
-  fprintf('fitting model...');
-  results = {};
-  [results{1},hrffitvoxels] = fitmodel_helper(design,data2,tr,hrfmodel,hrfknobs, ...
-                              opt,combinedmatrix,dimdata,dimtime,xyzsize,[]);
-  fprintf('done.\n');
+% BIG LOOP OVER CHUNKS
+for zz=1:length(chunks)
 
-case 'boot'
-
-  % this is the bootstrap case
-  
-  % set random seed
-  setrandstate({opt.seed});
-
-  % in this case (bootstrap + optimize), we should do a pre-call to get some cache
-  if isequal(hrfmodel,'optimize')
-    [d,d,cache] = fitmodel_helper(design,data2,tr,hrfmodel,hrfknobs, ...
-                                opt,combinedmatrix,dimdata,dimtime,xyzsize,[]);
+  % calc
+  if dochunk
+    datachunk = cellfun(@(x) x(:,chunks{zz}),data,'UniformOutput',0);
+    data2chunk = cellfun(@(x) x(:,chunks{zz}),data2,'UniformOutput',0);
   end
 
-  % loop over bootstraps and collect up the analysis results.
-  results = {};
-  fprintf('bootstrapping model');
-  for p=1:resampling
-    statusdots(p,resampling);
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% FIT MODELS
 
-    % figure out bootstrap sample
-    ix = [];
-    for q=1:max(opt.bootgroups)
-      num = sum(opt.bootgroups==q);  % number in this group
-      ix = [ix subscript(find(opt.bootgroups==q),ceil(rand(1,num)*num))];
-    end
-    
-    % fit the model to the bootstrap sample
+  switch resamplecase
+
+  case 'full'
+
+    % this is the full-fit case
+  
+    % fit the model to the entire dataset.  we obtain just one analysis result.
+    if ~opt.suppressoutput, fprintf('fitting model...');, end
+    results0 = {};
+    [results0{1},hrffitvoxels,cache] = fitmodel_helper(design,eval(data2name),tr,hrfmodel,hrfknobs, ...
+                                opt,combinedmatrix,dimdata,dimtime,cache);
+    if ~opt.suppressoutput, fprintf('done.\n');, end
+
+  case 'boot'
+
+    % this is the bootstrap case
+  
+    % set random seed
+    setrandstate({opt.seed});
+
+    % in this case (bootstrap + optimize), we should do a pre-call to get some cache
     if isequal(hrfmodel,'optimize')
-      cache2 = struct('design2pre',{cache.design2pre(ix)});
-    else
-      cache2 = [];
+      [d,d,cache] = fitmodel_helper(design,eval(data2name),tr,hrfmodel,hrfknobs, ...
+                                  opt,combinedmatrix,dimdata,dimtime,cache);
     end
-    [results{p},hrffitvoxels] = fitmodel_helper(design(ix),data2(ix),tr,hrfmodel,hrfknobs, ...
-                                opt,combinedmatrix(ix),dimdata,dimtime,xyzsize,cache2);
+
+    % loop over bootstraps and collect up the analysis results.
+    results0 = {};
+    if ~opt.suppressoutput, fprintf('bootstrapping model');, end
+    for p=1:resampling
+      statusdots(p,resampling);
+
+      % figure out bootstrap sample
+      ix = [];
+      for q=1:max(opt.bootgroups)
+        num = sum(opt.bootgroups==q);  % number in this group
+        ix = [ix subscript(find(opt.bootgroups==q),ceil(rand(1,num)*num))];
+      end
     
-  end
-  fprintf('done.\n');
+      % fit the model to the bootstrap sample
+      if isequal(hrfmodel,'optimize')
+        cache2 = struct('design2pre',{cache.design2pre(ix)});
+      else
+        cache2 = [];
+      end
+      [results0{p},hrffitvoxels] = fitmodel_helper(design(ix),subscript(eval(data2name),{ix}), ...
+                                     tr,hrfmodel,hrfknobs,opt,combinedmatrix(ix),dimdata,dimtime,cache2);
+    
+    end
+    if ~opt.suppressoutput, fprintf('done.\n');, end
   
-case 'xval'
+  case 'xval'
 
-  % this is the cross-validation case
+    % this is the cross-validation case
 
-  % loop over cross-validation iterations.  in each iteration, we record
-  % the analysis result and also record the time-series predictions.
-  modelfit = {};
-  results = {};
-  fprintf('cross-validating model');
-  for p=1:numruns
-    statusdots(p,numruns);
+    % loop over cross-validation iterations.  in each iteration, we record
+    % the analysis result and also record the time-series predictions.
+    modelfit = {};
+    results0 = {};
+    if ~opt.suppressoutput, fprintf('cross-validating model');, end
+    for p=1:numruns
+      statusdots(p,numruns);
     
-    % figure out resampling scheme
-    ix = setdiff(1:numruns,p);
+      % figure out resampling scheme
+      ix = setdiff(1:numruns,p);
     
-    % fit the model
-    [results{p},hrffitvoxels] = fitmodel_helper(design(ix),data2(ix),tr,hrfmodel,hrfknobs, ...
-                                opt,combinedmatrix(ix),dimdata,dimtime,xyzsize,[]);
+      % fit the model
+      [results0{p},hrffitvoxels] = fitmodel_helper(design(ix),subscript(eval(data2name),{ix}), ...
+                                     tr,hrfmodel,hrfknobs,opt,combinedmatrix(ix),dimdata,dimtime,[]);  % NOTE: no cache
     
-    % compute the prediction
-    modelfit(p) = GLMpredictresponses(results{p},{design{p}},tr,size(data2{p},1),1);  % 1 because results{p} is in flattened format
+      % compute the prediction
+      modelfit(p) = GLMpredictresponses(results0{p},{design{p}},tr,size(data2{p},1),1);  % 1 because results0{p} is in flattened format
     
-    % massage format
-    modelfit{p} = reshape(modelfit{p},[xyzsize size(modelfit{p},2)]);
-    
+    end
+    if ~opt.suppressoutput, fprintf('done.\n');, end
+
   end
-  fprintf('done.\n');
+
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% PREPARE MODEL ESTIMATES FOR OUTPUT
+
+  % in these special cases, we do not have to perform this section,
+  % so let's skip it to save computational time.
+  if (isequal(resamplecase,'xval') && mode==1)
+    results0 = struct();
+
+  % otherwise, do it as usual
+  else
+
+    if ~opt.suppressoutput, fprintf('preparing output...');, end
+    switch hrfmodel
+  
+    case 'fir'
+  
+      results0 = struct('models',cat(4,results0{:}));  % voxels x conditions x time x resamples
+      if size(results0.models,4) == 1
+        results0.modelmd = results0.models;
+        results0.modelse = zeros(size(results0.models),class(results0.models));
+      else
+        temp = zeros([sizefull(results0.models,3) 3],class(results0.models));
+        for p=1:size(results0.models,3)  % ugly to avoid memory usage
+          temp(:,:,p,:) = prctile(results0.models(:,:,p,:),[16 50 84],4);
+        end
+        results0.modelmd = temp(:,:,:,2);
+        results0.modelse = diff(temp(:,:,:,[1 3]),1,4)/2;
+        clear temp;
+      end
+  
+    case {'assume' 'optimize'}
+    
+      temp = catcell(2,cellfun(@(x) x(1),results0));
+      results0 = catcell(3,cellfun(@(x) x(2),results0));  % beware of MEMORY here
+      results0 = struct('models',{{temp results0}});  % ugly to avoid memory usage
+    
+      % deal with {1}
+      if size(results0.models{1},2) == 1
+        results0.modelmd{1} = results0.models{1};
+        results0.modelse{1} = zeros(size(results0.models{1}),class(results0.models{1}));
+      else
+        temp = prctile(results0.models{1},[16 50 84],2);
+        results0.modelmd{1} = temp(:,2);
+        results0.modelse{1} = diff(temp(:,[1 3]),1,2)/2;
+      end
+    
+      % deal with {2}
+      if size(results0.models{2},3) == 1
+        results0.modelmd{2} = results0.models{2};
+        results0.modelse{2} = zeros(size(results0.models{2}),class(results0.models{2}));
+      else
+        temp = zeros([sizefull(results0.models{2},2) 3],class(results0.models{2}));
+        for p=1:size(results0.models{2},2)  % ugly to avoid memory usage
+          temp(:,p,:) = prctile(results0.models{2}(:,p,:),[16 50 84],3);
+        end
+        results0.modelmd{2} = temp(:,:,2);
+        results0.modelse{2} = diff(temp(:,:,[1 3]),1,3)/2;
+        clear temp;
+      end
+  
+    end
+    if ~opt.suppressoutput, fprintf('done.\n');, end
+
+  end
+
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% COMPUTE MODEL FITS (IF NECESSARY)
+
+  if ~(mode==2)
+
+    if ~opt.suppressoutput, fprintf('computing model fits...');, end
+    switch resamplecase
+
+    case {'full' 'boot'}
+
+      % compute the time-series fit corresponding to the final model estimate
+      modelfit = GLMpredictresponses(results0.modelmd,design,tr,cellfun(@(x) size(x,1),eval(dataname)),1);  % note the 1 since flattened format
+
+    case 'xval'
+
+      % in the cross-validation case, we have already computed the cross-validated
+      % predictions of the model and stored them in the variable 'modelfit'.
+
+    end
+    if ~opt.suppressoutput, fprintf('done.\n');, end
+
+  end
+
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% COMPUTE R^2
+
+  if ~(mode==2)
+
+    if ~opt.suppressoutput, fprintf('computing R^2...');, end
+
+    % remove polynomials from the model fits (or predictions)
+    modelfit = cellfun(@(a,b) a*b',polymatrix,modelfit,'UniformOutput',0);  % result is time x voxels
+
+    % calculate overall R^2 [beware: MEMORY]
+    results0.R2 = calccodcell(modelfit,eval(dataname),1)';  % notice that we use 'data' not 'data2'
+
+    % calculate R^2 on a per-run basis [beware: MEMORY]
+    results0.R2run = catcell(2,cellfun(@(x,y) calccod(x,y,1,0,0)',modelfit,eval(dataname),'UniformOutput',0));
+
+    % clear
+    clear modelfit;  % big memory usage
+
+    if ~opt.suppressoutput, fprintf('done.\n');, end
+  
+  end
+
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% COLLECT UP RESULTS [UGLY BUT NECESSARY FOR REDUCED MEMORY USAGE!]
+
+  if isfield(results0,'models')  % this will fail only in the degenerate struct() case
+    if iscell(results0.models)
+
+      % deal with models
+      results.models{1} = results0.models{1};
+      if length(results.models) < 2
+        results.models{2} = results0.models{2};
+      else
+        results.models{2} = cat(1,results.models{2},results0.models{2});
+      end
+  
+      % deal with modelmd
+      results.modelmd{1} = results0.modelmd{1};
+      if length(results.modelmd) < 2
+        results.modelmd{2} = results0.modelmd{2};
+      else
+        results.modelmd{2} = cat(1,results.modelmd{2},results0.modelmd{2});
+      end
+  
+      % deal with modelse
+      results.modelse{1} = results0.modelse{1};
+      if length(results.modelse) < 2
+        results.modelse{2} = results0.modelse{2};
+      else
+        results.modelse{2} = cat(1,results.modelse{2},results0.modelse{2});
+      end
+
+    else
+
+      % deal with models
+      if isfield(results,'models')
+        results.models = cat(1,results.models,results0.models);
+      else
+        results.models = results0.models;
+      end
+
+      % deal with modelmd
+      if isfield(results,'modelmd')
+        results.modelmd = cat(1,results.modelmd,results0.modelmd);
+      else
+        results.modelmd = results0.modelmd;
+      end
+
+      % deal with modelse
+      if isfield(results,'modelse')
+        results.modelse = cat(1,results.modelse,results0.modelse);
+      else
+        results.modelse = results0.modelse;
+      end
+
+    end
+  end
+
+  if isfield(results0,'R2')  % this will fail in mode==2, so we must check it
+
+    if isfield(results,'R2')
+      results.R2 = cat(1,results.R2,results0.R2);
+    else
+      results.R2 = results0.R2;
+    end
+
+    if isfield(results,'R2run')
+      results.R2run = cat(1,results.R2run,results0.R2run);
+    else
+      results.R2run = results0.R2run;
+    end
+
+  end
 
 end
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% PREPARE MODEL ESTIMATES FOR OUTPUT
+% clean up
+clear datachunk data2chunk results0;
 
-% in this special case, we do not have to perform this section,
-% so let's skip it to save computational time.
-if isequal(resamplecase,'xval') && mode==1
-  results = struct();
-
-% otherwise, do it as usual
-else
-
-  fprintf('preparing output...');
-  switch hrfmodel
-  
-  case 'fir'
-  
-    results = struct('models',cat(4,results{:}));  % voxels x conditions x time x resamples
-    temp = zeros([sizefull(results.models,3) 3],class(results.models));
-    for p=1:size(results.models,3)  % ugly to avoid memory usage
-      temp(:,:,p,:) = prctile(results.models(:,:,p,:),[16 50 84],4);
-    end
-    results.modelmd = temp(:,:,:,2);
-    results.modelse = diff(temp(:,:,:,[1 3]),1,4)/2;
-    clear temp;
-    
-    % massage format
-    sz = sizefull(results.models,4);
-    results.models = reshape(results.models,[xyzsize sz(2:4)]);
-    results.modelmd = reshape(results.modelmd,[xyzsize sz(2:3)]);
-    results.modelse = reshape(results.modelse,[xyzsize sz(2:3)]);
-  
-  case {'assume' 'optimize'}
-    
-    temp = catcell(2,cellfun(@(x) x(1),results));
-    results = catcell(3,cellfun(@(x) x(2),results));
-    results = struct('models',{{temp results}});  % ugly to avoid memory usage
-    
-    % deal with {1}
-    temp = prctile(results.models{1},[16 50 84],2);
-    results.modelmd{1} = temp(:,2);
-    results.modelse{1} = diff(temp(:,[1 3]),1,2)/2;
-    
-    % deal with {2}
-    temp = zeros([sizefull(results.models{2},2) 3],class(results.models{2}));
-    for p=1:size(results.models{2},2)  % ugly to avoid memory usage
-      temp(:,p,:) = prctile(results.models{2}(:,p,:),[16 50 84],3);
-    end
-    results.modelmd{2} = temp(:,:,2);
-    results.modelse{2} = diff(temp(:,:,[1 3]),1,3)/2;
-    clear temp;
-    
-    % massage format
+% massage format
+if isfield(results,'models')  % this will fail only in the degenerate struct() case
+  if iscell(results.models)
     sz = sizefull(results.models{2},3);
     results.models{2} = reshape(results.models{2},[xyzsize sz(2:3)]);
     results.modelmd{2} = reshape(results.modelmd{2},[xyzsize sz(2)]);
     results.modelse{2} = reshape(results.modelse{2},[xyzsize sz(2)]);
-  
+  else
+    sz = sizefull(results.models,4);
+    results.models = reshape(results.models,[xyzsize sz(2:4)]);
+    results.modelmd = reshape(results.modelmd,[xyzsize sz(2:3)]);
+    results.modelse = reshape(results.modelse,[xyzsize sz(2:3)]);
   end
-  fprintf('done.\n');
-
 end
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% COMPUTE MODEL FITS (IF NECESSARY)
-
-fprintf('computing model fits...');
-switch resamplecase
-
-case {'full' 'boot'}
-
-  % compute the time-series fit corresponding to the final model estimate
-  modelfit = GLMpredictresponses(results.modelmd,design,tr,cellfun(@(x) size(x,1),data),dimdata);
-
-case 'xval'
-
-  % in the cross-validation case, we have already computed the cross-validated
-  % predictions of the model and stored them in the variable 'modelfit'.
-
+% massage more
+if isfield(results,'R2')
+  results.R2 = reshape(results.R2,[xyzsize 1]);
+  results.R2run = reshape(results.R2run,[xyzsize size(results.R2run,2)]);
 end
-fprintf('done.\n');
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% COMPUTE R^2
-
-fprintf('computing R^2...');
-
-% remove polynomials from the model fits (or predictions)
-modelfit = cellfun(@(a,b) a*squish(b,dimdata)',polymatrix,modelfit,'UniformOutput',0);  % format is now flattened!
-
-% calculate overall R^2
-results.R2 = reshape(calccodcell(modelfit,data,1)',[xyzsize 1]);  % notice that we use 'data' not 'data2'
-
-% calculate R^2 on a per-run basis
-results.R2run = catcell(dimdata+1,cellfun(@(x,y) reshape(calccod(x,y,1,0,0)',[xyzsize 1]),modelfit,data,'UniformOutput',0));
-
-% clear
-clear modelfit;  % big memory usage
-
-fprintf('done.\n');
+% NOTE: no need to massage or handle hrffitvoxels since it is only not []
+% in the hrfmodel 'optimize' case, and in that case, there is only one
+% iteration in the for-loop anyway.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% COMPUTE SNR
 
-fprintf('computing SNR...');
+if ~opt.suppressoutput, fprintf('computing SNR...');, end
 
-if ~(isequal(resamplecase,'xval') && mode==1)
+if ~(isequal(resamplecase,'xval') && mode==1) && ~(mode==2)
 
   switch hrfmodel
   
@@ -544,7 +707,7 @@ if ~(isequal(resamplecase,'xval') && mode==1)
 
 end
 
-fprintf('done.\n');
+if ~opt.suppressoutput, fprintf('done.\n');, end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% PREPARE ADDITIONAL OUTPUTS
 
@@ -587,13 +750,17 @@ end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% HELPER FUNCTION:
 
-function [f,hrffitvoxels,cache] = fitmodel_helper(design,data2,tr,hrfmodel,hrfknobs,opt,combinedmatrix,dimdata,dimtime,xyzsize,cache)
+function [f,hrffitvoxels,cache] = fitmodel_helper(design,data2,tr,hrfmodel,hrfknobs,opt,combinedmatrix,dimdata,dimtime,cache)
 
 % if hrfmodel is 'fir', then <f> will be voxels x conditions x time (flattened format)
 % if hrfmodel is 'assume' or 'optimize', then <f> will be {A B}
 %   where A is time x 1 and B is voxels x conditions (flattened format).
 % <hrffitvoxels> is [] unless hrfmodel is 'optimize', in which case it will be
 %   a column vector of voxel indices.
+%
+% NOTE ON MEMORY: let's assume <data2> is already small enough, so we don't have to 
+% do fancy memory handling here.  exception is 'optimize' (since we expect to get
+% the whole dataset in this case), and for this we use special handling of memory.
 
 % internal constants
 minR2 = 99;  % in 'optimize' mode, if R^2 between previous HRF and new HRF
@@ -739,13 +906,44 @@ case 'optimize'
     
       end
 
-      % estimate the amplitudes
-      currentbeta = mtimescell(olsmatrix2(cat(1,design2{:})),data2);  % conditions x voxels
+      % estimate the amplitudes.
 
-      % calculate R^2
-      modelfit = cellfun(@(x) x*currentbeta,design2,'UniformOutput',0);
-      R2 = calccodcell(modelfit,data2,1)';
-      clear modelfit;
+      % process all voxels simultaneously:
+      if isempty(opt.chunknum)
+
+        f = mtimescell(olsmatrix2(cat(1,design2{:})),data2);  % conditions x voxels
+
+        % calculate R^2
+        modelfit = cellfun(@(x) x*f,design2,'UniformOutput',0);
+        R2 = calccodcell(modelfit,data2,1)';
+        clear modelfit;
+
+      % process chunks of voxels to save MEMORY:
+      else
+        
+        % calc
+        numvoxels = size(data2{1},2);
+        precompute0 = olsmatrix2(cat(1,design2{:}));
+        
+        % initialize
+        f = zeros([numcond numvoxels],class(data2{1}));
+        R2 = zeros([numvoxels 1],class(data2{1}));
+        
+        % do it
+        chunks = chunking(1:numvoxels,opt.chunknum);
+        for zz=1:length(chunks)
+
+          datachunk = cellfun(@(x) x(:,chunks{zz}),data2,'UniformOutput',0);
+          f(:,chunks{zz}) = mtimescell(precompute0,datachunk);  % conditions x voxels
+
+          % calculate R^2
+          modelfit = cellfun(@(x) x*f(:,chunks{zz}),design2,'UniformOutput',0);
+          R2(chunks{zz}) = calccodcell(modelfit,datachunk,1)';
+
+        end
+        clear datachunk modelfit;
+        
+      end
     
       % figure out indices of good voxels
       if isequal(opt.hrffitmask,1)
@@ -770,7 +968,7 @@ case 'optimize'
         ntime = size(design{p},1);              % number of time points
         
         % weight and sum based on the current amplitude estimates.  only include the good voxels.
-        design2{p} = design2pre{p} * currentbeta(:,hrffitvoxels);  % time*L x voxels
+        design2{p} = design2pre{p} * f(:,hrffitvoxels);  % time*L x voxels
         
         % remove polynomials and extra regressors
         design2{p} = reshape(design2{p},ntime,[]);  % time x L*voxels
@@ -778,11 +976,16 @@ case 'optimize'
         design2{p} = permute(reshape(design2{p},ntime,numinhrf,[]),[1 3 2]);  % time x voxels x L
     
       end
-
+      
       % estimate the HRF
       previoushrf = currenthrf;
       datasubset = cellfun(@(x) x(:,hrffitvoxels),data2,'UniformOutput',0);
       currenthrf = olsmatrix2(squish(cat(1,design2{:}),2)) * vflatten(cat(1,datasubset{:}));
+
+      % if HRF is all zeros (this can happen when the data are all zeros), get out prematurely
+      if all(currenthrf==0)
+        break;
+      end
 
       % check for convergence
       if calccod(previoushrf,currenthrf,[],0,0) >= minR2 && cnt > 2
@@ -796,18 +999,18 @@ case 'optimize'
   end
   
   % sanity check
-  if calccod(hrfknobs,previoushrf,[],0,0) < 50
+  if calccod(hrfknobs,previoushrf,[],0,0) < opt.hrfthresh
     warning('Global HRF estimate is far from the initial seed, probably indicating low SNR.  We are just going to use the initial seed as the HRF estimate.');
-    [f,hrffitvoxels] = fitmodel_helper(design,data2,tr,'assume',hrfknobs,opt,combinedmatrix,dimdata,dimtime,xyzsize,[]);
+    [f,hrffitvoxels,cache] = fitmodel_helper(design,data2,tr,'assume',hrfknobs,opt,combinedmatrix,dimdata,dimtime,cache);
     return;
   end
 
   % normalize results
   mx = max(previoushrf);
   previoushrf = previoushrf / mx;
-  currentbeta = currentbeta * mx;
+  f = f * mx;
   
   % return
-  f = {previoushrf currentbeta'};
+  f = {previoushrf f'};
 
 end

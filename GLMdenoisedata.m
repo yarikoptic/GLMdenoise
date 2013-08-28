@@ -48,6 +48,8 @@ function [results,denoiseddata] = GLMdenoisedata(design,data,stimdur,tr,hrfmodel
 %   20.  Default in the case of 'assume' and 'optimize' is to use a 
 %   canonical HRF that is calculated based on <stimdur> and <tr>.
 % <opt> (optional) is a struct with the following fields:
+%   <chunknum> (optional)##############CHUNKING (NOT TRUE LIMIT)
+%      hedge about hrfmodel 'optimize'! (but only in estimatmodel call)
 %   <extraregressors> (optional) is time x regressors or a cell vector
 %     of elements that are each time x regressors.  The dimensions of 
 %     <extraregressors> should mirror that of <design> (i.e. same number of 
@@ -112,6 +114,14 @@ function [results,denoiseddata] = GLMdenoisedata(design,data,stimdur,tr,hrfmodel
 %    -B: where B is the number of PCs to use for the final model (thus, the user
 %        chooses).  B can be any integer between 0 and opt.numpcstotry.
 %     Default: 1.05.
+%   <pccontrolmode> (optional) is for testing purposes.  Default is 0 which means
+%     to do nothing special.  If 1, then after we are done constructing the global
+%     noise regressors, we scramble the phase spectra of these regressors (prior
+%     to entering them into the GLM).  If 2, then after we are done constructing the
+%     global noise regressors, we shuffle the assignment of global noise regressors
+%     to the runs, ensuring that each run is assigned a new set of regressors.  Note that
+%     in this shuffling, the grouping of regressors (at the run level) is maintained.
+%     The shuffling is performed prior to entering global noise regressors into the GLM.
 %   <numboots> (optional) is a positive integer indicating the number of 
 %     bootstraps to perform for the final model.  Special case is 0 which
 %     indicates that the final model should just be fit to the complete
@@ -127,7 +137,9 @@ function [results,denoiseddata] = GLMdenoisedata(design,data,stimdur,tr,hrfmodel
 %     then separate copies of the data will be returned in the rows of 
 %     <denoiseddata>.  Default: '11101' which indicates that all components of 
 %     the data will be returned except for the component corresponding to the 
-%     estimate of the contribution of the global noise regressors.
+%     estimate of the contribution of the global noise regressors.  To indicate
+%     that you do not want any denoised data, set <denoisespec> to {}.  This is
+%     a good idea if you want to save on memory usage.
 %   <wantpercentbold> (optional) is whether to convert the amplitude estimates
 %     in 'models', 'modelmd', and 'modelse' to percent BOLD change.  This is
 %     done as the very last step, and is accomplished by dividing by the 
@@ -324,6 +336,8 @@ function [results,denoiseddata] = GLMdenoisedata(design,data,stimdur,tr,hrfmodel
 % times at which data are actually sampled.
 %
 % History:
+% - 2013/05/22: add opt.pccontrolmode
+% - 2013/05/21: add opt.chunknum
 % - 2013/05/12: allow <design> to specify onset times
 % - 2013/05/12: add opt.brainexclude and associated figure
 % - 2013/05/12: add SNRbefore and SNRafter fields and associated figures
@@ -398,8 +412,12 @@ else
   dimtime = 2;
   xyzsize = size(data{1},1);
 end
+numvoxels = prod(xyzsize);
 
 % deal with defaults
+if ~isfield(opt,'chunknum') || isempty(opt.chunknum)
+  opt.chunknum = [];
+end
 if ~isfield(opt,'extraregressors') || isempty(opt.extraregressors)
   opt.extraregressors = cell(1,numruns);
 end
@@ -442,10 +460,13 @@ end
 if ~isfield(opt,'pcstop') || isempty(opt.pcstop)
   opt.pcstop = 1.05;
 end
+if ~isfield(opt,'pccontrolmode') || isempty(opt.pccontrolmode)
+  opt.pccontrolmode = 0;
+end
 if ~isfield(opt,'numboots') || isempty(opt.numboots)
   opt.numboots = 100;
 end
-if ~isfield(opt,'denoisespec') || isempty(opt.denoisespec)
+if ~isfield(opt,'denoisespec') || (isempty(opt.denoisespec) && ~iscell(opt.denoisespec))
   opt.denoisespec = '11101';
 end
 if ~isfield(opt,'wantpercentbold') || isempty(opt.wantpercentbold)
@@ -480,7 +501,7 @@ end
 switch hrfmodel
 case 'optimize'
   fprintf('*** GLMdenoisedata: performing full fit to estimate global HRF. ***\n');
-  fullfit = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,0,opt);
+  fullfit = GLMestimatemodel(design,data,stimdur,tr,hrfmodel,hrfknobs,0,opt,[],2);
   hrf = fullfit.modelmd{1};
   hrffitvoxels = fullfit.hrffitvoxels;
   clear fullfit;
@@ -502,9 +523,9 @@ end
 fprintf('*** GLMdenoisedata: performing cross-validation to determine R^2 values. ***\n');
 switch hrfmodel
 case {'optimize' 'assume'}
-  xvalfit = GLMestimatemodel(design,data,stimdur,tr,'assume',hrf,-1,opt,1);
+  xvalfit = GLMestimatemodel(design,data,stimdur,tr,'assume',hrf,-1,opt,[],1);
 case 'fir'
-  xvalfit = GLMestimatemodel(design,data,stimdur,tr,'fir',hrfknobs,-1,opt,1);
+  xvalfit = GLMestimatemodel(design,data,stimdur,tr,'fir',hrfknobs,-1,opt,[],1);
 end
 pcR2 = xvalfit.R2;
 clear xvalfit;
@@ -544,6 +565,58 @@ for p=1:length(data)
 end
 clear temp len u s v;
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% PERTURB THE GLOBAL NOISE REGRESSORS (IF REQUESTED)
+
+switch opt.pccontrolmode
+
+% do nothing (this is the default)
+case 0
+
+% phase-scramble each regressor
+case 1
+
+  % for each run
+  for p=1:length(pcregressors)
+  
+    % for each regressor
+    for q=1:size(pcregressors{p},2)
+    
+      % the original regressor
+      temp = pcregressors{p}(:,q);
+
+      % a sample of white noise
+      temp2 = randn(size(temp));
+
+      % new regressor has the amplitude spectrum of the original regressor,
+      % but the phase spectrum of the white noise
+      pcregressors{p}(:,q) = real(ifft(abs(fft(temp,[],1)) .* exp(j * angle(fft(temp2,[],1)))));
+
+    end
+
+  end
+  clear temp temp2;
+
+% shuffle regressors across runs (ensuring none match up to the original assignment)
+case 2
+
+  % repeat until we have a satisfactory assignment
+  while 1
+  
+    % generate a random permutation
+    temp = permutedim(1:length(pcregressors));
+    
+    % if none matched the original assignment, we are done
+    if ~any(temp == (1:length(pcregressors)))
+      break;
+    end
+
+  end
+
+  % shuffle the regressors
+  pcregressors = pcregressors(temp);
+
+end
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% ADD GLOBAL NOISE REGRESSORS INTO MODEL AND CHOOSE OPTIMAL NUMBER
 
 % perform cross-validation with increasing number of global noise regressors
@@ -556,9 +629,9 @@ for p=1:opt.numpcstotry
   opt2.wantpercentbold = 0;  % no need to do this, so optimize for speed
   switch hrfmodel
   case {'optimize' 'assume'}
-    xvalfit = GLMestimatemodel(design,data,stimdur,tr,'assume',hrf,-1,opt2,1);
+    xvalfit = GLMestimatemodel(design,data,stimdur,tr,'assume',hrf,-1,opt2,[],1);
   case 'fir'
-    xvalfit = GLMestimatemodel(design,data,stimdur,tr,'fir',hrfknobs,-1,opt2,1);
+    xvalfit = GLMestimatemodel(design,data,stimdur,tr,'fir',hrfknobs,-1,opt2,[],1);
   end
   pcR2 = cat(dimdata+1,pcR2,xvalfit.R2);
 end
@@ -651,17 +724,31 @@ clear amp signal_nodenoise noise_nodenoise;
 
 fprintf('*** GLMdenoisedata: calculating denoised data and PC weights. ***\n');
 
+% figure out chunks
+if isempty(opt.chunknum)
+  dochunk = 0;
+  chunks = [1];  % dummy to get the for-loop going
+  dataname = 'squish(data{p},dimdata)';
+  modelmdname = 'results.modelmd';
+  modelmddim = 3;
+else
+  dochunk = 1;
+  chunks = chunking(1:numvoxels,opt.chunknum);
+  dataname = 'datachunk';
+  modelmdname = 'modelmdchunk';
+  modelmddim = 1;
+end
+
 % for each run, perform regression to figure out the various contributions
-denoiseddata = {};
-results.pcweights = zeros([prod(xyzsize) results.pcnum numruns]);
+denoiseddata = cell(length(opt.denoisespec),numruns);
+for p=1:numel(denoiseddata)
+  denoiseddata{p} = cast(denoiseddata{p},dataclass);
+end
+results.pcweights = zeros([numvoxels results.pcnum numruns],dataclass);
 for p=1:numruns
 
   % calc
   numtime = size(data{p},dimtime);
-
-  % calculate signal contribution
-  modelcomponent = GLMpredictresponses(results.modelmd,{design{p}},tr,numtime,dimdata);
-  modelcomponent = modelcomponent{1};  % X x Y x Z x T
 
   % prepare polynomial regressors
   polymatrix = constructpolynomialmatrix(numtime,0:opt.maxpolydeg(p));
@@ -674,35 +761,66 @@ for p=1:numruns
   % prepare global noise regressors
   pcmatrix = results.pcregressors{p}(:,1:results.pcnum);
   numpc = size(pcmatrix,2);
-
-  % estimate weights
-  h = olsmatrix2(cat(2,polymatrix,exmatrix,pcmatrix))*squish(data{p} - modelcomponent,dimdata)';  % parameters x voxels
-
-  % record weights on global noise regressors
-  results.pcweights(:,:,p) = h(numpoly+numex+(1:numpc),:)';
   
-  % construct time-series
-  polycomponent = reshape((polymatrix*h(1:numpoly,:))',[xyzsize numtime]);
-  if numex == 0
-    excomponent = zeros([xyzsize numtime],dataclass);
-  else
-    excomponent = reshape((exmatrix*h(numpoly+(1:numex),:))',[xyzsize numtime]);
-  end
-  if numpc == 0
-    pccomponent = zeros([xyzsize numtime],dataclass);
-  else
-    pccomponent = reshape((pcmatrix*h(numpoly+numex+(1:numpc),:))',[xyzsize numtime]);
-  end
-  residcomponent = data{p} - (modelcomponent + polycomponent + excomponent + pccomponent);
+  % calc
+  precompute0 = olsmatrix2(cat(2,polymatrix,exmatrix,pcmatrix));
+
+  % loop over chunks
+  for zz=1:length(chunks)
   
-  % construct denoised data
-  for q=1:length(opt.denoisespec)
-    denoiseddata{q,p} = bitget(bin2dec(opt.denoisespec{q}),5) * modelcomponent + ...
-                       bitget(bin2dec(opt.denoisespec{q}),4) * polycomponent + ...
-                       bitget(bin2dec(opt.denoisespec{q}),3) * excomponent + ...
-                       bitget(bin2dec(opt.denoisespec{q}),2) * pccomponent + ...
-                       bitget(bin2dec(opt.denoisespec{q}),1) * residcomponent;
+    % calc
+    if dochunk
+      datachunk = subscript(squish(data{p},dimdata),{chunks{zz} ':'});  % voxels x time
+      if iscell(results.modelmd)
+        modelmdchunk = {results.modelmd{1} subscript(squish(results.modelmd{2},dimdata),{chunks{zz} ':'})};
+      else
+        modelmdchunk = subscript(squish(results.modelmd,dimdata),{chunks{zz} ':'});
+      end
+    end
+
+    % calculate signal contribution
+    modelcomponent = GLMpredictresponses(eval(modelmdname),{design{p}},tr,numtime,modelmddim);
+    modelcomponent = modelcomponent{1};
+    modelcomponent = squish(modelcomponent,modelmddim);  % voxels x time
+
+    % estimate weights
+    h = precompute0*(eval(dataname) - modelcomponent)';  % parameters x voxels
+
+    % record weights on global noise regressors
+    if dochunk
+      results.pcweights(chunks{zz},:,p) = h(numpoly+numex+(1:numpc),:)';
+    else
+      results.pcweights(:,:,p)          = h(numpoly+numex+(1:numpc),:)';
+    end
+  
+    % construct time-series
+    polycomponent = (polymatrix*h(1:numpoly,:))';  % voxels x time
+    if numex == 0
+      excomponent = zeros(size(polycomponent),dataclass);
+    else
+      excomponent = (exmatrix*h(numpoly+(1:numex),:))';  % voxels x time
+    end
+    if numpc == 0
+      pccomponent = zeros(size(polycomponent),dataclass);
+    else
+      pccomponent = (pcmatrix*h(numpoly+numex+(1:numpc),:))';  % voxels x time
+    end
+    residcomponent = eval(dataname) - (modelcomponent + polycomponent + excomponent + pccomponent);  % voxels x time
+  
+    % construct denoised data (each element is voxels x time)
+    for q=1:length(opt.denoisespec)
+      denoiseddata{q,p} = cat(1,denoiseddata{q,p}, ...
+                         bitget(bin2dec(opt.denoisespec{q}),5) * modelcomponent + ...
+                         bitget(bin2dec(opt.denoisespec{q}),4) * polycomponent + ...
+                         bitget(bin2dec(opt.denoisespec{q}),3) * excomponent + ...
+                         bitget(bin2dec(opt.denoisespec{q}),2) * pccomponent + ...
+                         bitget(bin2dec(opt.denoisespec{q}),1) * residcomponent);
+    end
+
   end
+  
+  % clean up
+  clear datachunk modelmdchunk;
 
 end
 
@@ -710,6 +828,9 @@ end
 clear modelcomponent h polycomponent excomponent pccomponent residcomponent;
 
 % prepare for output
+for p=1:numel(denoiseddata)
+  denoiseddata{p} = reshape(denoiseddata{p},[xyzsize size(denoiseddata{p},2)]);
+end
 results.pcweights = reshape(results.pcweights,[xyzsize results.pcnum numruns]);
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% PREPARE ADDITIONAL OUTPUTS
@@ -726,7 +847,7 @@ results.inputs.opt = opt;
 results.inputs.figuredir = figuredir;
 
 % prepare pcR2final
-results.pcR2final = results.pcR2(:,:,:,1+results.pcnum);
+results.pcR2final = subscript(results.pcR2,[repmat({':'},[1 dimdata]) {1+results.pcnum}]);
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% CONVERT TO % BOLD CHANGE
 
@@ -735,11 +856,23 @@ if opt.wantpercentbold
   con = 1./abs(results.meanvol) * 100;
   switch hrfmodel
   case 'fir'
-    results.models = bsxfun(@times,results.models,con);
+    for p=1:size(results.models,dimdata+3)  % ugly to save MEMORY
+      if dimdata==3
+        results.models(:,:,:,:,:,p) = bsxfun(@times,results.models(:,:,:,:,:,p),con);
+      else
+        results.models(:,:,:,p) = bsxfun(@times,results.models(:,:,:,p),con);
+      end
+    end
     results.modelmd = bsxfun(@times,results.modelmd,con);
     results.modelse = bsxfun(@times,results.modelse,con);
   case {'assume' 'optimize'}
-    results.models{2} = bsxfun(@times,results.models{2},con);
+    for p=1:size(results.models{2},dimdata+2)  % ugly to save MEMORY
+      if dimdata==3
+        results.models{2}(:,:,:,:,p) = bsxfun(@times,results.models{2}(:,:,:,:,p),con);
+      else
+        results.models{2}(:,:,p) = bsxfun(@times,results.models{2}(:,:,p),con);
+      end
+    end
     results.modelmd{2} = bsxfun(@times,results.modelmd{2},con);
     results.modelse{2} = bsxfun(@times,results.modelse{2},con);
   end
@@ -819,14 +952,14 @@ if ~isempty(figuredir)
   % write out image showing the actual voxels used for PC selection
   imwrite(uint8(255*makeimagestack(results.pcvoxels,[0 1])),gray(256),[figuredir '/PCvoxels.png']);
 
-  % figure out an upper bound for the R^2 values
-  upperb = prctile(results.pcR2(:),99);
+  % figure out bounds for the R^2 values
+  bounds = prctile(results.pcR2(:),[1 99]);
 
   % define a function that will write out R^2 values to an image file
   imfun = @(results,filename) ...
     imwrite(uint8(255*makeimagestack(signedarraypower(results/100,0.5),[0 1])),hot(256),filename);
   imfunB = @(results,filename) ...
-    imwrite(uint8(255*makeimagestack(signedarraypower(results/upperb,0.5),[0 1])),hot(256),filename);
+    imwrite(uint8(255*makeimagestack(signedarraypower(normalizerange(results,0,1,bounds(1),bounds(2)),0.5),[0 1])),hot(256),filename);
 
   % write out cross-validated R^2 for the various numbers of PCs
   for p=1:size(results.pcR2,dimdata+1)
@@ -851,6 +984,9 @@ if ~isempty(figuredir)
   
   % write out SNR comparison figures (first figure)
   rng = [min([results.SNRbefore(:); results.SNRafter(:)]) max([results.SNRbefore(:); results.SNRafter(:)])];
+  if ~all(isfinite(rng))  % hack to deal with cases of no noise estimate
+    rng = [0 1];
+  end
   figureprep([100 100 500 500]); hold on;
   scattersparse(results.SNRbefore(:),results.SNRafter(:),20000,0,36,'g','.');
   scattersparse(results.SNRbefore(pcvoxels),results.SNRafter(pcvoxels),20000,0,36,'r','.');
