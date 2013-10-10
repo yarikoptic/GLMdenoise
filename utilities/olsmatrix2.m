@@ -43,16 +43,20 @@ end
 
 % do it
 if any(bad)
-
   f = zeros(size(X,2),size(X,1));
-  lastwarn('');
-  f(good,:) = (X(:,good)'*X(:,good))\X(:,good)';
-  assert(isempty(lastwarn),lastwarn);
-
+  f(good,:) = olsmatrix2_helper(X(:,good));
 else
-
-  lastwarn('');
-  f = (X'*X)\X';
-  assert(isempty(lastwarn),lastwarn);
-
+  f = olsmatrix2_helper(X);
 end
+
+function f_=olsmatrix2_helper(X_)
+  lastwarn('');
+  try,
+      f_ = (X_'*X_)\X_';
+      assert(isempty(lastwarn),lastwarn);
+  catch ME
+      fprintf(2, 'MATLAB threw exception %s\n', ME.message);
+      fprintf(2, 'Computing OLS solution via pinv\n');
+      f_ = pinv(X_'*X_) * X_';
+  end;
+
