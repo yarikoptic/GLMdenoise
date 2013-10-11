@@ -1040,21 +1040,7 @@ if opt.separatemodels
   % 'estimate' requires design to be in format #2, so we might need to convert
   % while rounding onsets to closest
   if iscell(design{1})
-      % yoh: disclaimer -- yarik used matlab more than 10 years ago last time
-      new_design = {};
-      for chunk=1:size(design, 1)
-          d = zeros(size(data{chunk}, dimtime), size(design{chunk}, 1));
-          for ev=1:size(design{chunk}, 1)
-              onsets = design{chunk}{ev};
-              for i=1:size(onsets, 1)
-                  vol = round(onsets(i)/tr);
-                  d(vol+1, ev) = 1;
-              end
-          end
-          new_design{chunk} = d;
-      end
-      assert(length(new_design) == length(design));
-      design = new_design;
+      design = convert_design3to2(design, data, tr);
   end
 
   % initialize
