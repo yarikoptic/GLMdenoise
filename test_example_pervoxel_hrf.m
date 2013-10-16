@@ -3,31 +3,31 @@
 %addpath('/home/data/famface/try-customhrf/GLMdenoise/utilities')
 
 nnuisances = 3;                         % number of random nuisance variables to be mixed in through the voxels
-anuisances = 0.09;
-anoise = 0.05;
+anuisances = 0.6;
+anoise = 0.2;
 
-srandom_variance = 0.1;
+srandom_variance = 0.2;
 
 baseline = 100;
 stimdur = 1;
 tr = 2.0;
 bdur = round(8/tr); %  block duration in volumes -- not quite a gamma, right? ;)
 opt = struct();
-% opt.separatemodels = 1;
+% opt.modelpv = 1;
 opt.maxpolydeg = 0;                     %  for some reason even if virtually noiseless -- looks like hrf was accounting for some filtering of the model on the edges... thought that it might have been due to polynomials... wrong
 opt.seed = 0;
 
+design = {};
 % very cruel simple case
 % design = {{[2, 19, 30]; [8,12,27]}; {[0, 12, 29]; [6, 32, 37]}};
-% xyzsize = [4, 6, 6];
-% tsize = 20
-% nruns = 2
+nruns = 3;
+tsize = 100;
+xyzsize = [4, 6, 6];
 
 % somewhat more realistic although still stupid case
-nruns = 6;
-design = {};
-tsize = 100;
-xyzsize = [15, 16, 10];
+%nruns = 6;
+%tsize = 100;
+%xyzsize = [15, 16, 10];
 
 % very silly design, I know
 for r=1:nruns
@@ -94,7 +94,7 @@ design = convert_design3to2(design, data, tr);
 % run the beast
 hrfknobs = [];                           % no assumption
 hrfmodel = 'fir'; hrfknobs = 10;
-results_denoise = GLMdenoisedata(design, data, stimdur, tr, hrfmodel, hrfknobs, opt, 'GLMdenoisefigures')
+[results_denoise, denoiseddata] = GLMdenoisedata(design, data, stimdur, tr, hrfmodel, hrfknobs, opt, 'GLMdenoisefigures')
 
 if hrfmodel == 'fir'
  % plot for our two mighty EVs
@@ -105,8 +105,9 @@ if hrfmodel == 'fir'
   ev_rec = conv(squeeze(design{1}(:, ev)), ev_hrf);
   figure; plot(x, squeeze(design{1}(:, ev)), 'g', ...
                x, ev_rec(1:tsize), 'b', ...
-               x, squeeze(data{1}(ev,2,3,:)) - baseline, 'r');
-  legend('onsets', 'reconstructed (up to scale)', 'original')
+               x, squeeze(data{1}(ev,2,3,:)) - baseline, 'r', ...
+               x, squeeze(denoiseddata{1}(ev, 2, 3, :)) - baseline, 'm');
+  legend('onsets', 'reconstructed (up to scale)', 'original', 'denoised')
   title(ev)
  end
 end
