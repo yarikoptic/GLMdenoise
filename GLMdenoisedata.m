@@ -146,9 +146,10 @@ function [results,denoiseddata] = GLMdenoisedata(design,data,stimdur,tr,hrfmodel
 %     absolute value of 'meanvol' and multiplying by 100.  (The absolute
 %     value prevents negative values in 'meanvol' from flipping the sign.)
 %     Default: 1.
-%   <separatemodels> (optional) after denoising estimate separate
-%     HRF and betas per each voxel. modelmd and R2 estimates with a 'unified' HRF
-%     will be store under modelmd_ and R2_. Default: 0.
+%   <modelpv> (optional) after denoising estimate separate
+%     HRF and betas per each voxel. Model estimates will be output in
+%     modelmdpv and R2pv will contain R2 estimates separate per each voxel.
+%     Default: 0.
 % <figuredir> (optional) is a directory to which to write figures.  (If the
 %   directory does not exist, we create it; if the directory already exists,
 %   we delete its contents so we can start afresh.)  If [], no figures are
@@ -475,8 +476,8 @@ end
 if ~isfield(opt,'wantpercentbold') || isempty(opt.wantpercentbold)
   opt.wantpercentbold = 1;
 end
-if ~isfield(opt,'separatemodels') || isempty(opt.separatemodels)
-  opt.separatemodels = 0;
+if ~isfield(opt,'modelpv') || isempty(opt.modelpv)
+  opt.modelpv = 0;
 end
 if ~isequal(hrfmodel,'fir')
   hrfknobs = normalizemax(hrfknobs);
@@ -1025,7 +1026,7 @@ end
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% ESTIMATE RESPONSES PER VOXEL NOW
-if opt.separatemodels
+if opt.modelpv
   % yoh: would actually need outside since design at this stage should
   % be different, where superordinate categories are not collapsed
   % together... actually why? estimates are done per trial
@@ -1076,9 +1077,7 @@ if opt.separatemodels
 
   end
   % Store the results
-  results.modelmd_ = results.modelmd;
-  results.modelmd = {reshape(hrfs', [xyzsize, size(hrfs, 1)]), ...
-                     reshape(betas, [xyzsize, size(betas, 2)])};
-  results.R2_ = results.R2;
-  results.R2 = R2;
+  results.modelmdpv = {reshape(hrfs', [xyzsize, size(hrfs, 1)]), ...
+                       reshape(betas, [xyzsize, size(betas, 2)])};
+  results.R2pv = R2;
 end
