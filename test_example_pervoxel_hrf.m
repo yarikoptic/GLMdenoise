@@ -6,6 +6,8 @@ nnuisances = 3;                         % number of random nuisance variables to
 anuisances = 0.09;
 anoise = 0.05;
 
+srandom_variance = 0.1;
+
 baseline = 100;
 stimdur = 1;
 tr = 2.0;
@@ -52,10 +54,11 @@ for chunk=1:length(design)
             vol = round(design{chunk}{ev}(i)/tr)+1;
             % for both conditions
             uvol = min(tsize, vol+bdur-1);
+            nvols = length(vol:uvol);
             % let's have 3 informative voxels
-            data_signal{chunk}(ev,2,3,vol:uvol) = data_signal{chunk}(ev,2,3,vol:uvol) + 1;
+            data_signal{chunk}(ev,2,3,vol:uvol) = data_signal{chunk}(ev,2,3,vol:uvol) + 1 + randn(1, 1, 1, nvols)*srandom_variance;
             % first two with separate EV in each, while 3rd one would have all mixed equally
-            data_signal{chunk}(3,2,3,vol:uvol) = data_signal{chunk}(3,2,3,vol:uvol) + 1;
+            data_signal{chunk}(3,2,3,vol:uvol) = data_signal{chunk}(3,2,3,vol:uvol) + 1 + randn(1, 1, 1, nvols)*srandom_variance;
         end
     end
     % add some common noise (nuisances) components
